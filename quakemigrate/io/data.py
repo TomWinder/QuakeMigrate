@@ -219,6 +219,8 @@ class Archive:
 
             # Merge all traces with contiguous data, or overlapping data which
             # exactly matches (== st._cleanup(); i.e. no clobber)
+            for tr in st:
+                tr.stats.network = "TW"
             st.merge(method=-1)
 
             # Make copy of raw waveforms to output if requested
