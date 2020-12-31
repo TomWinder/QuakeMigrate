@@ -15,6 +15,7 @@ import logging
 import numpy as np
 from obspy import UTCDateTime
 import pandas as pd
+from scipy.ndimage import gaussian_filter1d
 
 from quakemigrate.io import Run, read_scanmseed, write_triggered_events
 from quakemigrate.plot import trigger_summary
@@ -163,7 +164,10 @@ class Trigger:
             self.static_threshold = kwargs.get("static_threshold", 1.5)
         elif self.threshold_method == "dynamic":
             self.mad_window_length = kwargs.get("mad_window_length", 3600.)
-            self.mad_multiplier = kwargs.get("mad_multiplier", 1.)
+            self.mad_multiplier = kwargs.get("mad_multiplier", 1.5)
+        elif self.threshold_method == "median":
+            self.median_window_length = kwargs.get("median_window_length", 3600.)
+            self.median_multiplier = kwargs.get("median_multiplier", 1.)
         else:
             raise util.InvalidTriggerThresholdMethodException
         self.marginal_window = kwargs.get("marginal_window", 2.)
@@ -172,9 +176,13 @@ class Trigger:
             self.minimum_repeat = kwargs.get("minimum_repeat")
         self.normalise_coalescence = kwargs.get("normalise_coalescence", False)
         self.pad = kwargs.get("pad", 120.)
+        self.smooth_coa = kwargs.get("smooth_coa", False)
+        self.smoothing_params = kwargs.get("smoothing_params", [12, 4])
 
         # --- Plotting toggles and parameters ---
         self.plot_trigger_summary = kwargs.get("plot_trigger_summary", True)
+
+        # --- Plotting parameters ---
         self.xy_files = kwargs.get("xy_files")
         self.plot_all_stns = kwargs.get("plot_all_stns", True)
 
@@ -194,6 +202,9 @@ class Trigger:
         elif self.threshold_method == "dynamic":
             out += (f"\t\tMAD Window     = {self.mad_window_length}\n"
                     f"\t\tMAD Multiplier = {self.mad_multiplier}\n")
+        elif self.threshold_method == "median":
+            out += (f"\t\tMedian Window     = {self.median_window_length}\n"
+                    f"\t\tMedian Multiplier = {self.median_multiplier}\n")
 
         return out
 
@@ -267,6 +278,15 @@ class Trigger:
         data, stats = read_scanmseed(self.run, batchstart, batchend, self.pad,
                                      self.lut.unit_conversion_factor)
 
+        if self.smooth_coa:
+            logging.info("\tApplying smoothing...")
+            st_dev = self.smoothing_params[0]
+            truncate = self.smoothing_params[1]
+            data.loc[:, "COA"] = gaussian_filter1d(data["COA"], st_dev,
+                                                   truncate=truncate)
+            data.loc[:, "COA_N"] = gaussian_filter1d(data["COA_N"], st_dev,
+                                                     truncate=truncate)
+
         logging.info("\n\tTriggering events...")
         trigger_on = "COA_N" if self.normalise_coalescence else "COA"
         threshold = self._get_threshold(data[trigger_on], stats.sampling_rate)
@@ -337,6 +357,21 @@ class Trigger:
 
             # Set the dynamic threshold
             threshold = median_trace + (mad_trace * self.mad_multiplier)
+        elif self.threshold_method == "median":
+            # Split the data in window_length chunks
+            breaks = np.arange(len(scandata))
+            breaks = breaks[breaks % int(self.median_window_length
+                                         * sampling_rate) == 0][1:]
+            chunks = np.split(scandata.values, breaks)
+
+            # Calculate the median values
+            median_values = np.asarray([np.median(chunk) for chunk in chunks])
+            median_trace = chunks2trace(median_values, (len(chunks),
+                                                        len(chunks[0])))
+            median_trace = median_trace[:len(scandata)]
+
+            # Set the dynamic threshold
+            threshold = median_trace * self.median_multiplier
         else:
             # Set static threshold
             threshold = np.zeros_like(scandata) + self.static_threshold
@@ -379,7 +414,7 @@ class Trigger:
 
         triggers = pd.DataFrame(columns=CANDIDATES_COLS)
         for i, candidate in enumerate(candidates):
-            peak = candidate.loc[candidate[trigger_on].idxmax()]
+            peak = candidate.loc[candidate["COA"].idxmax()]
 
             # If first sample above threshold is within the marginal window
             if (peak["DT"] - candidate["DT"].iloc[0]) < self.marginal_window:
